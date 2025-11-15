@@ -18,7 +18,7 @@ const path = require('path')
 const axios = require('axios')
 const { handleMessages, handleGroupParticipantUpdate, handleStatus } = require('./main');
 const PhoneNumber = require('awesome-phonenumber')
-const { smsg, generateMessageTag, getBuffer, getSizeMedia, fetch, sleep, reSize } = require('./lib/myfunc')
+const { smsg, generateMessageTag, getBuffer, getSizeMedia, fetch, await, sleep, reSize } = require('./lib/myfunc')
 const {
     default: makeWASocket,
     useMultiFileAuthState,
@@ -69,20 +69,23 @@ setInterval(() => {
     }
 }, 30_000) // check every 30 seconds
 
-let phoneNumber = process.env.PHONE_NUMBER || settings.ownerNumber || "2250501758422"
+// CORRECTION : Utiliser le numéro de téléphone des settings
+let phoneNumber = settings.ownerNumber || process.env.PHONE_NUMBER || "2250501758422"
 let owner = []
 try {
     owner = JSON.parse(fs.readFileSync('./data/owner.json'))
 } catch (error) {
-    console.log('⚠️ owner.json not found or invalid, using default owner')
-    owner = [phoneNumber]
+    console.log('⚠️ Fichier owner.json non trouvé, utilisation des settings')
+    owner = [settings.ownerNumber || phoneNumber]
 }
 
 global.phoneNumber = phoneNumber
 global.botname = "DR XENON"
 global.themeemoji = "•"
-const pairingCode = !!phoneNumber && process.argv.includes("--pairing-code")
-const useMobile = process.argv.includes("--mobile")
+
+// CORRECTION : Toujours utiliser pairing code pour plus de simplicité
+const pairingCode = true // Forcer l'utilisation du pairing code
+const useMobile = false // Désactivé car incompatible avec pairing code
 
 // Only create readline interface if we're in an interactive environment
 const rl = process.stdin.isTTY ? readline.createInterface({ input: process.stdin, output: process.stdout }) : null
@@ -104,7 +107,7 @@ async function startXeonBotInc() {
         const XeonBotInc = makeWASocket({
             version,
             logger: pino({ level: 'silent' }),
-            printQRInTerminal: !pairingCode,
+            printQRInTerminal: false, // Désactivé car on utilise pairing code
             browser: ["Ubuntu", "Chrome", "20.0.04"],
             auth: {
                 creds: state.creds,
@@ -112,21 +115,75 @@ async function startXeonBotInc() {
             },
             markOnlineOnConnect: true,
             generateHighQualityLinkPreview: true,
-            syncFullHistory: false, // Changed to false for better performance
+            syncFullHistory: true,
             getMessage: async (key) => {
-                try {
-                    let jid = jidNormalizedUser(key.remoteJid)
-                    let msg = await store.loadMessage(jid, key.id)
-                    return msg?.message || ""
-                } catch (error) {
-                    return ""
-                }
+                let jid = jidNormalizedUser(key.remoteJid)
+                let msg = await store.loadMessage(jid, key.id)
+                return msg?.message || ""
             },
             msgRetryCounterCache,
-            defaultQueryTimeoutMs: 60000,
+            defaultQueryTimeoutMs: undefined,
         })
 
         store.bind(XeonBotInc.ev)
+
+        // CORRECTION : Gestion du pairing code AVANT les autres événements
+        if (!XeonBotInc.authState.creds.registered) {
+            console.log(chalk.yellow('📱 Configuration du pairing code...'))
+            
+            let phoneNumberToUse = phoneNumber
+            
+            // Si pas de numéro dans les settings, demander interactivement
+            if (!phoneNumberToUse && rl) {
+                phoneNumberToUse = await question(chalk.bgBlack(chalk.greenBright(`\nVeuillez entrer votre numéro WhatsApp 😍\nFormat: 2250500107362 (sans + ou espaces) : `)))
+            }
+
+            if (!phoneNumberToUse) {
+                console.log(chalk.red('❌ Aucun numéro de téléphone fourni. Vérifiez vos settings.'))
+                process.exit(1)
+            }
+
+            // Nettoyer le numéro de téléphone
+            phoneNumberToUse = phoneNumberToUse.replace(/[^0-9]/g, '')
+
+            // Validation du numéro
+            try {
+                const pn = new PhoneNumber(phoneNumberToUse, 'ZZ') // 'ZZ' pour numéro international
+                if (!pn.isValid()) {
+                    console.log(chalk.red('❌ Numéro de téléphone invalide. Format: 2250500107362 (sans +)'))
+                    process.exit(1)
+                }
+            } catch (error) {
+                console.log(chalk.yellow('⚠️ Validation du numéro ignorée, continuation...'))
+            }
+
+            console.log(chalk.blue(`🔢 Numéro utilisé: ${phoneNumberToUse}`))
+
+            // Demander le pairing code
+            try {
+                const code = await XeonBotInc.requestPairingCode(phoneNumberToUse)
+                const formattedCode = code?.match(/.{1,4}/g)?.join("-") || code
+                
+                console.log(chalk.green('\n╔══════════════════════════════════════╗'))
+                console.log(chalk.green('║           🤖 PAIRING CODE           ║'))
+                console.log(chalk.green('╠══════════════════════════════════════╣'))
+                console.log(chalk.green(`║          ${chalk.bold.white(formattedCode)}          ║`))
+                console.log(chalk.green('╚══════════════════════════════════════╝'))
+                
+                console.log(chalk.yellow('\n📝 Instructions:'))
+                console.log(chalk.white('1. Ouvrez WhatsApp sur votre téléphone'))
+                console.log(chalk.white('2. Allez dans Paramètres > Appareils liés'))
+                console.log(chalk.white('3. Appuyez sur "Lier un appareil"'))
+                console.log(chalk.white('4. Entrez le code ci-dessus'))
+                console.log(chalk.white('5. Attendez la connexion...\n'))
+                
+            } catch (error) {
+                console.log(chalk.red('❌ Erreur lors de la demande du pairing code:'))
+                console.log(chalk.red(error.message))
+                console.log(chalk.yellow('💡 Vérifiez votre numéro et réessayez'))
+                process.exit(1)
+            }
+        }
 
         // Message handling
         XeonBotInc.ev.on('messages.upsert', async chatUpdate => {
@@ -134,12 +191,10 @@ async function startXeonBotInc() {
                 const mek = chatUpdate.messages[0]
                 if (!mek.message) return
                 mek.message = (Object.keys(mek.message)[0] === 'ephemeralMessage') ? mek.message.ephemeralMessage.message : mek.message
-                
                 if (mek.key && mek.key.remoteJid === 'status@broadcast') {
                     await handleStatus(XeonBotInc, chatUpdate);
                     return;
                 }
-                
                 if (!XeonBotInc.public && !mek.key.fromMe && chatUpdate.type === 'notify') return
                 if (mek.key.id.startsWith('BAE5') && mek.key.id.length === 16) return
 
@@ -155,7 +210,16 @@ async function startXeonBotInc() {
                     // Only try to send error message if we have a valid chatId
                     if (mek.key && mek.key.remoteJid) {
                         await XeonBotInc.sendMessage(mek.key.remoteJid, {
-                            text: '❌ An error occurred while processing your message.'
+                            text: '❌ An error occurred while processing your message.',
+                            contextInfo: {
+                                forwardingScore: 1,
+                                isForwarded: true,
+                                forwardedNewsletterMessageInfo: {
+                                    newsletterJid: '120363161513685998@newsletter',
+                                    newsletterName: 'KnightBot MD',
+                                    serverMessageId: -1
+                                }
+                            }
                         }).catch(console.error);
                     }
                 }
@@ -202,59 +266,30 @@ async function startXeonBotInc() {
 
         XeonBotInc.serializeM = (m) => smsg(XeonBotInc, m, store)
 
-        // Handle pairing code - CORRECTION IMPORTANTE
-        if (pairingCode && !XeonBotInc.authState.creds.registered) {
-            if (useMobile) throw new Error('Cannot use pairing code with mobile api')
+        // Connection handling
+        XeonBotInc.ev.on('connection.update', async (s) => {
+            const { connection, lastDisconnect } = s
+            if (connection == "open") {
+                console.log(chalk.green('\n✅ Connexion WhatsApp établie avec succès!'))
+                console.log(chalk.yellow(`🌿 Connecté en tant que: ` + JSON.stringify(XeonBotInc.user.id, null, 2)))
 
-            let phoneNumberInput
-            if (global.phoneNumber) {
-                phoneNumberInput = global.phoneNumber
-            } else {
-                phoneNumberInput = await question(chalk.bgBlack(chalk.greenBright(`Please type your WhatsApp number 😍\nFormat: 2250500107362 (without + or spaces) : `)))
-            }
-
-            // Clean the phone number - remove any non-digit characters
-            phoneNumberInput = phoneNumberInput.replace(/[^0-9]/g, '')
-
-            // Validate the phone number using awesome-phonenumber
-            try {
-                const pn = new PhoneNumber(phoneNumberInput, '');
-                if (!pn.isValid()) {
-                    console.log(chalk.red('Invalid phone number. Please enter your full international number (e.g., 2250500107362) without + or spaces.'));
-                    process.exit(1);
-                }
-
-                setTimeout(async () => {
-                    try {
-                        let code = await XeonBotInc.requestPairingCode(phoneNumberInput)
-                        code = code?.match(/.{1,4}/g)?.join("-") || code
-                        console.log(chalk.black(chalk.bgGreen(`Your Pairing Code : `)), chalk.black(chalk.white(code)))
-                        console.log(chalk.yellow(`\nPlease enter this code in your WhatsApp app:\n1. Open WhatsApp\n2. Go to Settings > Linked Devices\n3. Tap "Link a Device"\n4. Enter the code shown above`))
-                    } catch (error) {
-                        console.error('Error requesting pairing code:', error)
-                        console.log(chalk.red('Failed to get pairing code. Please check your phone number and try again.'))
-                    }
-                }, 3000)
-            } catch (error) {
-                console.error('Phone number validation error:', error)
-            }
-        }
-
-        // Connection handling - AMÉLIORATION
-        XeonBotInc.ev.on('connection.update', async (update) => {
-            const { connection, lastDisconnect, qr } = update
-            
-            if (connection === "open") {
-                console.log(chalk.magenta(` `))
-                console.log(chalk.yellow(`🌿Connected to => ` + JSON.stringify(XeonBotInc.user, null, 2)))
-
+                // Envoyer un message de confirmation
                 try {
                     const botNumber = XeonBotInc.user.id.split(':')[0] + '@s.whatsapp.net';
                     await XeonBotInc.sendMessage(botNumber, {
-                        text: `🤖 Bot Connected Successfully!\n\n⏰ Time: ${new Date().toLocaleString()}\n✅ Status: Online and Ready!`
-                    }).catch(console.error);
+                        text: `🤖 Bot Connecté avec Succès!\n\n⏰ Heure: ${new Date().toLocaleString()}\n✅ Statut: En ligne et prêt!`,
+                        contextInfo: {
+                            forwardingScore: 1,
+                            isForwarded: true,
+                            forwardedNewsletterMessageInfo: {
+                                newsletterJid: '120363161513685998@newsletter',
+                                newsletterName: 'KnightBot MD',
+                                serverMessageId: -1
+                            }
+                        }
+                    });
                 } catch (error) {
-                    console.log('Could not send connection message:', error)
+                    console.log('⚠️ Impossible d\'envoyer le message de confirmation')
                 }
 
                 await delay(1999)
@@ -264,44 +299,23 @@ async function startXeonBotInc() {
                 console.log(chalk.magenta(`${global.themeemoji || '•'} GITHUB: mrunqiuehacker`))
                 console.log(chalk.magenta(`${global.themeemoji || '•'} WA NUMBER: ${owner}`))
                 console.log(chalk.magenta(`${global.themeemoji || '•'} CREDIT: MR UNIQUE HACKER`))
-                console.log(chalk.green(`${global.themeemoji || '•'} 🤖 Bot Connected Successfully! ✅`))
-                console.log(chalk.blue(`Bot Version: ${settings.version || '1.0.0'}`))
+                console.log(chalk.green(`${global.themeemoji || '•'} 🤖 Bot Connecté avec Succès! ✅`))
+                console.log(chalk.blue(`Version du Bot: ${settings.version}`))
             }
-            
-            // Gestion du QR Code
-            if (qr) {
-                console.log(chalk.green('Scan the QR code above to connect'))
-            }
-            
             if (connection === 'close') {
-                let reason = new Boom(lastDisconnect?.error)?.output?.statusCode
-                console.log('Connection closed:', reason)
+                const statusCode = lastDisconnect?.error?.output?.statusCode
+                console.log(chalk.yellow(`🔌 Connexion fermée (Code: ${statusCode})`))
                 
-                if (reason === DisconnectReason.badSession) {
-                    console.log(chalk.red('Bad Session File, Please Delete Session and Scan Again'))
-                    startXeonBotInc()
-                } else if (reason === DisconnectReason.connectionClosed) {
-                    console.log(chalk.yellow('Connection closed, reconnecting....'))
-                    startXeonBotInc()
-                } else if (reason === DisconnectReason.connectionLost) {
-                    console.log(chalk.yellow('Connection Lost from Server, reconnecting...'))
-                    startXeonBotInc()
-                } else if (reason === DisconnectReason.connectionReplaced) {
-                    console.log(chalk.red('Connection Replaced, Another New Session Opened, Please Close Current Session First'))
-                    process.exit()
-                } else if (reason === DisconnectReason.loggedOut) {
-                    console.log(chalk.red('Device Logged Out, Please Scan Again And Run.'))
-                    rmSync("./session", { recursive: true, force: true })
-                    startXeonBotInc()
-                } else if (reason === DisconnectReason.restartRequired) {
-                    console.log(chalk.yellow('Restart Required, Restarting...'))
-                    startXeonBotInc()
-                } else if (reason === DisconnectReason.timedOut) {
-                    console.log(chalk.yellow('Connection TimedOut, Reconnecting...'))
-                    startXeonBotInc()
+                if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
+                    try {
+                        rmSync('./session', { recursive: true, force: true })
+                        console.log(chalk.red('🗑️ Session déconnectée. Fichiers supprimés.'))
+                    } catch { }
+                    console.log(chalk.yellow('🔄 Redémarrage dans 5 secondes...'))
+                    setTimeout(startXeonBotInc, 5000)
                 } else {
-                    console.log(chalk.red(`Unknown DisconnectReason: ${reason}|${lastDisconnect.error}`))
-                    startXeonBotInc()
+                    console.log(chalk.yellow('🔄 Reconnexion dans 3 secondes...'))
+                    setTimeout(startXeonBotInc, 3000)
                 }
             }
         })
@@ -312,14 +326,8 @@ async function startXeonBotInc() {
         // Anticall handler: block callers when enabled
         XeonBotInc.ev.on('call', async (calls) => {
             try {
-                let state = { enabled: false }
-                try {
-                    const { readState: readAnticallState } = require('./commands/anticall');
-                    state = readAnticallState();
-                } catch (error) {
-                    // If anticall module doesn't exist, ignore
-                }
-                
+                const { readState: readAnticallState } = require('./commands/anticall');
+                const state = readAnticallState();
                 if (!state.enabled) return;
                 for (const call of calls) {
                     const callerJid = call.from || call.peerJid || call.chatId;
@@ -343,11 +351,7 @@ async function startXeonBotInc() {
                     } catch {}
                     // Then: block after a short delay to ensure rejection and message are processed
                     setTimeout(async () => {
-                        try { 
-                            if (typeof XeonBotInc.updateBlockStatus === 'function') {
-                                await XeonBotInc.updateBlockStatus(callerJid, 'block'); 
-                            }
-                        } catch {}
+                        try { await XeonBotInc.updateBlockStatus(callerJid, 'block'); } catch {}
                     }, 800);
                 }
             } catch (e) {
@@ -361,27 +365,33 @@ async function startXeonBotInc() {
             await handleGroupParticipantUpdate(XeonBotInc, update);
         });
 
+        XeonBotInc.ev.on('messages.upsert', async (m) => {
+            if (m.messages[0].key && m.messages[0].key.remoteJid === 'status@broadcast') {
+                await handleStatus(XeonBotInc, m);
+            }
+        });
+
         XeonBotInc.ev.on('status.update', async (status) => {
             await handleStatus(XeonBotInc, status);
         });
 
-        XeonBotInc.ev.on('messages.reaction', async (reaction) => {
-            // Handle reactions if needed
+        XeonBotInc.ev.on('messages.reaction', async (status) => {
+            await handleStatus(XeonBotInc, status);
         });
 
         return XeonBotInc
 
     } catch (error) {
-        console.error('Error starting bot:', error)
-        // Retry after 5 seconds
-        setTimeout(startXeonBotInc, 5000)
+        console.error(chalk.red('❌ Erreur lors du démarrage du bot:'), error)
+        console.log(chalk.yellow('🔄 Nouvelle tentative dans 10 secondes...'))
+        setTimeout(startXeonBotInc, 10000)
     }
 }
 
 // Start the bot with error handling
 startXeonBotInc().catch(error => {
     console.error('Fatal error:', error)
-    setTimeout(startXeonBotInc, 5000)
+    process.exit(1)
 })
 
 process.on('uncaughtException', (err) => {
